@@ -1,7 +1,7 @@
 [project]
 name = "dto-tui"
-version = "0.1.0"
-description = "Terminal UI for AWS Data Transfer Out cost and volume, backed by Cost Explorer"
+version = "0.2.0"
+description = "Terminal UI for AWS data transfer volume, backed by Cost Explorer"
 license = "MIT"
 requires-python = ">=3.11"
 # Keep in sync with the PEP 723 header in dto_tui.py, which is what `uv run dto_tui.py` uses.
