@@ -1,6 +1,6 @@
 # DTO TUI
 
-Single-file Textual TUI (`dto_tui.py`) for AWS Data Transfer Out cost and volume via Cost Explorer. Ported from the DTO Explorer web app (github.com/zscclabs/dto-explorer, local checkout `~/toil/dto`), whose `backend/app/*.py` are the source for the core sections.
+Single-file Textual TUI (`dto_tui.py`) for AWS data transfer volume via Cost Explorer. Ported from the DTO Explorer web app (github.com/zscclabs/dto-explorer, local checkout `~/toil/dto`), whose `backend/app/*.py` are the source for the core sections.
 
 - Keep it one file, runnable with `uv run dto_tui.py`; dependencies go in both the PEP 723 header and `pyproject.toml`.
 - Core logic (top of the file) must stay free of UI concerns; the Textual UI is the bottom section.

@@ -6,6 +6,23 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+Ported from [DTO Explorer](https://github.com/zscclabs/dto-explorer) v0.3.0.
+
+### Changed (breaking)
+- The TUI reports data transfer **volume only**. Cost, the cost metric choice, the discounts switch, cost per GB and the `--metric` and `--include-discounts` options are gone. The table, KPIs and transfer type panel show GB.
+- "Inter-Region" is renamed "Inter-Region Out".
+- CSV export columns are `<breakdown>, label, gb, pct, gb_<transfer type>…`.
+- By default only internet traffic is counted. Inter-AZ, Inter-Region Out/In and To CloudFront are hidden behind an **Include traffic within AWS** switch (`--include-aws-internal`).
+
+### Added
+- Inbound traffic: Internet In (`*DataTransfer-In-Bytes`), Inter-Region In (`*-AWS-In-Bytes`) and Other In.
+- Direction (Out / In / Transit) as a filter and a breakdown (`DIRECTION`), with egress, ingress and transit totals and their change against the previous period.
+- Egress, Ingress and Transit KPI tiles and egress / ingress sparklines. Inter-AZ, NAT Gateway and To CloudFront are labelled as transit.
+- **Include NAT volume** switch (`--include-nat-volume`) to add NAT Gateway data processed back into transit.
+
+### Fixed
+- Data volume no longer double-counts NAT Gateway traffic: NAT data processed is left out of every total by default.
+
 ## [0.1.0] - 2026-10-27
 
 ### Added

@@ -41,12 +41,12 @@ def test_app_drill_down_and_export(tmp_path, monkeypatch):
     asyncio.run(run())
     [path] = tmp_path.glob("dto_*_TAG-vpc.csv")
     header = next(csv.reader(path.open()))
-    assert header[:5] == ["TAG:vpc", "label", "cost_usd", "gb", "pct"]
+    assert header[:5] == ["TAG:vpc", "label", "gb", "pct", "gb_Internet Out"]
 
 
-def test_app_period_navigation_and_discounts():
+def test_app_period_navigation_and_switches():
     async def run() -> None:
-        app = _app(period="week", anchor=date(2026, 10, 14))
+        app = _app(period="week", anchor=date(2026, 10, 14), filters={"TRANSFER_TYPE": ["Inter-AZ", "Internet Out"]})
         async with app.run_test(size=(160, 50)) as pilot:
 
             async def settle() -> None:
@@ -58,11 +58,25 @@ def test_app_period_navigation_and_discounts():
             await pilot.press("left_square_bracket")
             await settle()
             assert app.summary.window.start == date(2026, 10, 5)
+            assert not app.query_one("#kpi-transit").display  # nothing can be in transit by default
 
-            gross = app.summary.total_cost
-            app.query_one("#discounts").value = True
+            app.query_one("#aws-internal").value = True
             await settle()
-            assert app.summary.include_discounts and app.summary.total_cost < gross
+            assert app.summary.include_aws_internal and app.summary.transit_gb > 0
+            assert app.query_one("#kpi-transit").display
+            assert "Egress" in str(app.query_one("#kpi-egress").render())
+
+            # Hiding traffic within AWS drops the now-impossible Inter-AZ filter value.
+            app.query_one("#aws-internal").value = False
+            await settle()
+            assert app.state.filters == {"TRANSFER_TYPE": ["Internet Out"]}
+            assert app.summary.transit_gb == 0
+
+            app.state.filters = {}
+            app.query_one("#nat").value = True
+            await settle()
+            assert app.summary.include_nat_volume and app.summary.by_type["NAT Gateway"] > 0
+            assert app.summary.transit_gb == app.summary.by_type["NAT Gateway"]
 
     asyncio.run(run())
 
@@ -71,3 +85,8 @@ def test_parse_args():
     args = parse_args(["--mock", "--period", "custom", "--start", "2026-07-01", "--end", "2026-09-30", "--filter", "REGION=us-east-1"])
     assert args.mock and args.period == "custom"
     assert args.filters == {"REGION": ["us-east-1"]}
+    assert not args.include_aws_internal and not args.include_nat_volume
+
+    args = parse_args(["--include-aws-internal", "--include-nat-volume", "--group-by", "DIRECTION", "--filter", "DIRECTION=In"])
+    assert args.include_aws_internal and args.include_nat_volume
+    assert args.group_by == "DIRECTION" and args.filters == {"DIRECTION": ["In"]}
