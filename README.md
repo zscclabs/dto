@@ -14,10 +14,10 @@ It's a single self-contained Python script ([`dto_tui.py`](dto_tui.py)) built on
 - **Other:** [CSV files as a data source](docs/csv-data.md), CSV export, [Include traffic within AWS](#internet-traffic-by-default) and [Include NAT volume](#avoiding-double-counting) switches, and a mock-data mode that needs no AWS account
 
 ## Quick start
-You need [uv](https://docs.astral.sh/uv/). The script declares its dependencies inline ([PEP 723](https://peps.python.org/pep-0723/)), so uv installs them on first run, and you can copy the file anywhere.
+You need [uv](https://docs.astral.sh/uv/). The script declares its dependencies inline ([PEP 723](https://peps.python.org/pep-0723/)), so uv installs them on first run, and you can copy the file anywhere. Download it from the [latest release](https://github.com/zscclabs/dto/releases/latest), or a specific version from [Releases](https://github.com/zscclabs/dto/releases).
 
 ```bash
-curl -O https://raw.githubusercontent.com/zscclabs/dto/main/dto_tui.py
+curl -LO https://github.com/zscclabs/dto/releases/latest/download/dto_tui.py
 
 uv run dto_tui.py --mock --tag-key vpc          # synthetic data, no AWS needed
 
