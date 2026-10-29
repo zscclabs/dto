@@ -2,7 +2,7 @@
 
 A terminal UI that totals **AWS data transfer volume** (GB) for a week, a month or a custom date range. By default it shows traffic to and from the internet: egress leaving AWS and ingress arriving in AWS. A switch adds traffic that stays on AWS's network (inter-AZ, inter-region and to CloudFront). It breaks the volume down by region, account, direction, transfer type, service, usage type, cost allocation tag (for example a VPC tag) or cost category. It reports volume only, not cost.
 
-It's a single self-contained Python script ([`dto_tui.py`](dto_tui.py)) built on [Textual](https://textual.textualize.io/) and boto3, with AWS Cost Explorer as the data source. It's a terminal port of the [DTO Explorer](https://github.com/zscclabs/dto-explorer) web app and gives the same numbers.
+It's a single self-contained Python script ([`dto_tui.py`](dto_tui.py)) built on [Textual](https://textual.textualize.io/) and boto3, with AWS Cost Explorer as the data source, or [CSV files exported with the AWS CLI](docs/csv-data.md). It's a terminal port of the [DTO Explorer](https://github.com/zscclabs/dto-explorer) web app and gives the same numbers.
 
 ![DTO TUI: KPIs, volume sparklines, share by transfer type and a breakdown by VPC tag](docs/screenshot.png)
 
@@ -11,7 +11,7 @@ It's a single self-contained Python script ([`dto_tui.py`](dto_tui.py)) built on
 - **Headline numbers:** internet egress and ingress volume (plus transit inside AWS when shown), each with the change against the previous period of the same length, plus the top contributor
 - **Charts and table:** egress and ingress sparklines, share by transfer type, and a sortable, searchable table with drill-down
 - **Filters:** account, region, direction and transfer type, plus drill-down filters on any dimension
-- **Other:** CSV export, [Include traffic within AWS](#internet-traffic-by-default) and [Include NAT volume](#avoiding-double-counting) switches, and a mock-data mode that needs no AWS account
+- **Other:** [CSV files as a data source](docs/csv-data.md), CSV export, [Include traffic within AWS](#internet-traffic-by-default) and [Include NAT volume](#avoiding-double-counting) switches, and a mock-data mode that needs no AWS account
 
 ## Quick start
 You need [uv](https://docs.astral.sh/uv/). The script declares its dependencies inline ([PEP 723](https://peps.python.org/pep-0723/)), so uv installs them on first run, and you can copy the file anywhere.
@@ -24,6 +24,16 @@ uv run dto_tui.py --mock --tag-key vpc          # synthetic data, no AWS needed
 aws sso login --profile my-profile               # or any other way of getting credentials
 uv run dto_tui.py --profile my-profile           # real data
 ```
+
+### CSV files instead of Cost Explorer
+Export the data once with the AWS CLI, then run the TUI on the files with no AWS credentials and no Cost Explorer charges:
+
+```bash
+mkdir -p data && scripts/export-ce-csv.sh 2026-09-01 2026-10-01 > data/2026-09.csv   # needs the AWS CLI and jq
+uv run dto_tui.py --csv ./data --start 2026-09-01
+```
+
+The CSV format, the export script and the raw `aws ce` commands are described in [docs/csv-data.md](docs/csv-data.md). The files use the same format as DTO Explorer's `DTO_CSV_PATH`.
 
 Start in a particular view from the command line:
 ```bash
@@ -44,7 +54,7 @@ Filters for the same dimension are OR'd and different dimensions are AND'd. An e
 | `/` | Search rows |
 | `s`, or click a header | Sort |
 | `e` | Export CSV to the current directory |
-| `r` | Clear the cache and refresh |
+| `r` | Clear the cache and refresh (with `--csv`, re-read the files) |
 | `d` | Light / dark theme |
 | `?` | Help |
 | `q` | Quit |
@@ -62,6 +72,7 @@ Each option can also come from an environment variable, which the flag overrides
 |---|---|---|---|
 | `--profile` | `DTO_AWS_PROFILE` | – | AWS profile; otherwise the standard boto3 chain (including `AWS_PROFILE`) |
 | `--mock` | `DTO_MOCK` | off | Synthetic data instead of calling AWS |
+| `--csv PATH` | `DTO_CSV_PATH` | – | Read usage from a CSV file or folder instead of calling AWS ([format](docs/csv-data.md)); not with `--mock` |
 | `--cache-ttl` | `DTO_CACHE_TTL_SECONDS` | `3600` | Cache lifetime; `0` disables caching |
 | `--tag-key` | `DTO_DEFAULT_TAG_KEY` | – | Tag key to group by initially (e.g. `vpc`) |
 | `--ce-region` | `DTO_CE_REGION` | `us-east-1` | Cost Explorer endpoint region |
@@ -133,7 +144,7 @@ uv run pytest -q      # tests: classification, periods, summaries on mock data, 
 uv run dto_tui.py --mock
 ```
 
-The script keeps the sections of the DTO Explorer backend it was ported from (periods, cache, Cost Explorer client, mock client, models, DTO service), each labelled with its source file. When changing classification or query logic there, port the change here too. CI (`.github/workflows/ci.yml`) runs the tests on Python 3.11 and 3.13 and checks that the script runs from its inline metadata.
+The script keeps the sections of the DTO Explorer backend it was ported from (periods, cache, Cost Explorer client, mock client, CSV client, models, DTO service), each labelled with its source file. `scripts/export-ce-csv.sh` and `docs/csv-data.md` come from DTO Explorer too. When changing classification or query logic there, port the change here too. CI (`.github/workflows/ci.yml`) runs the tests on Python 3.11 and 3.13 and checks that the script runs from its inline metadata.
 
 The version lives in `pyproject.toml` and `__version__` in `dto_tui.py`, which must match. Dependencies are listed both in `pyproject.toml` and in the script's PEP 723 header.
 

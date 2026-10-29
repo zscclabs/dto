@@ -3,3 +3,6 @@ __pycache__/
 .pytest_cache/
 .env
 dto_*.csv
+
+# Exported billing data (docs/csv-data.md)
+/data/

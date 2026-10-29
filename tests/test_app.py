@@ -6,7 +6,7 @@ from dto_tui import Cache, CostExplorer, DtoApp, DtoService, MockCostExplorerCli
 
 
 def _app(**state) -> DtoApp:
-    service = DtoService(CostExplorer(MockCostExplorerClient()), Cache(3600), mock=True)
+    service = DtoService(CostExplorer(MockCostExplorerClient()), Cache(3600), source="mock")
     return DtoApp(service, ViewState(**state), tag_key="vpc")
 
 

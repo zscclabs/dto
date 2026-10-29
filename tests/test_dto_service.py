@@ -189,7 +189,7 @@ def test_summary_with_stubbed_cost_explorer():
 
 @pytest.fixture
 def mock_service() -> DtoService:
-    return DtoService(CostExplorer(MockCostExplorerClient()), Cache(0), mock=True)
+    return DtoService(CostExplorer(MockCostExplorerClient()), Cache(0), source="mock")
 
 
 @pytest.mark.parametrize("group_by", ["REGION", "LINKED_ACCOUNT", "SERVICE", "TRANSFER_TYPE", "DIRECTION", "USAGE_TYPE", "TAG:vpc", "COST_CATEGORY:Business Unit"])

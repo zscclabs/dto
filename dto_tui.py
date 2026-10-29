@@ -9,17 +9,20 @@
 """DTO TUI: AWS data transfer volume in the terminal.
 
 A self-contained port of the DTO Explorer backend (https://github.com/zscclabs/dto-explorer)
-with a Textual UI. Run it with `uv run dto_tui.py` (add `--mock` for synthetic data, no AWS needed).
+with a Textual UI. Run it with `uv run dto_tui.py` (add `--mock` for synthetic data, no AWS needed,
+or `--csv PATH` to read usage exported with scripts/export-ce-csv.sh).
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
 import math
 import os
 import random
 import re
+import sys
 import threading
 import time
 from collections import defaultdict
@@ -183,6 +186,10 @@ class CostExplorer:
     def __init__(self, client: Any):
         self._client = client
 
+    @property
+    def client(self) -> Any:
+        return self._client
+
     def dimension_values(self, dimension: str, start: date, end: date, search: str | None = None) -> list[dict[str, Any]]:
         kwargs: dict[str, Any] = {"TimePeriod": _period(start, end), "Dimension": dimension, "Context": "COST_AND_USAGE"}
         if search:
@@ -251,9 +258,11 @@ class CostExplorer:
             kwargs["NextPageToken"] = token
 
 
-def make_cost_explorer(mock: bool, profile: str | None, region: str = "us-east-1") -> CostExplorer:
+def make_cost_explorer(mock: bool, profile: str | None, region: str = "us-east-1", csv_path: Path | None = None) -> CostExplorer:
     if mock:
         return CostExplorer(MockCostExplorerClient())
+    if csv_path:
+        return CostExplorer(CsvCostExplorerClient(csv_path))
 
     import boto3
     from botocore.config import Config
@@ -266,6 +275,8 @@ def make_cost_explorer(mock: bool, profile: str | None, region: str = "us-east-1
 # =====================================================================================
 # Synthetic Cost Explorer for --mock (dto-explorer backend/app/mock_ce.py)
 # =====================================================================================
+# The filter and grouping helpers are shared with the CSV client: a line item is anything
+# with attr(dim), tags and cost_categories.
 
 MOCK_ACCOUNTS = {"111111111111": "prod", "222222222222": "staging", "333333333333": "data-platform", "444444444444": "shared-services"}
 _MOCK_BU = {"111111111111": "Core", "222222222222": "Core", "333333333333": "Analytics", "444444444444": "Platform"}
@@ -287,6 +298,11 @@ class _Line:
     seed: int
     tags: dict[str, str] = field(default_factory=dict)
     record_type: str = "Usage"
+    cost_categories: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.cost_categories:
+            self.cost_categories = {"Business Unit": _MOCK_BU.get(self.account, "")}
 
     def gb_on(self, d: date) -> float:
         rng = random.Random(self.seed * 100_003 + d.toordinal())
@@ -302,9 +318,6 @@ class _Line:
             "SERVICE": self.service,
             "RECORD_TYPE": self.record_type,
         }.get(dim, "")
-
-    def category(self, key: str) -> str:
-        return _MOCK_BU.get(self.account, "") if key == "Business Unit" else ""
 
 
 def _mock_lines() -> list[_Line]:
@@ -340,7 +353,7 @@ def _mock_lines() -> list[_Line]:
     return lines
 
 
-def _mock_matches(line: _Line, expr: dict[str, Any] | None) -> bool:
+def _mock_matches(line: Any, expr: dict[str, Any] | None) -> bool:
     if not expr:
         return True
     if "And" in expr:
@@ -352,7 +365,7 @@ def _mock_matches(line: _Line, expr: dict[str, Any] | None) -> bool:
     if "Dimensions" in expr:
         d = expr["Dimensions"]
         return line.attr(d["Key"]) in d.get("Values", [])
-    for kind, get in (("Tags", lambda k: line.tags.get(k, "")), ("CostCategories", line.category)):
+    for kind, get in (("Tags", lambda k: line.tags.get(k, "")), ("CostCategories", lambda k: line.cost_categories.get(k, ""))):
         if kind in expr:
             value = get(expr[kind]["Key"])
             if "ABSENT" in expr[kind].get("MatchOptions", []):
@@ -361,12 +374,22 @@ def _mock_matches(line: _Line, expr: dict[str, Any] | None) -> bool:
     return True
 
 
-def _mock_group_key(line: _Line, g: dict[str, str]) -> str:
+def _mock_group_key(line: Any, g: dict[str, str]) -> str:
     if g["Type"] == "TAG":
         return f"{g['Key']}${line.tags.get(g['Key'], '')}"
     if g["Type"] == "COST_CATEGORY":
-        return f"{g['Key']}${line.category(g['Key'])}"
+        return f"{g['Key']}${line.cost_categories.get(g['Key'], '')}"
     return line.attr(g["Key"])
+
+
+def _buckets(start: date, end: date, granularity: str) -> list[tuple[date, date]]:
+    out = []
+    cur = start
+    while cur < end:
+        nxt = cur + timedelta(days=1) if granularity == "DAILY" else _add_months(cur, 1)
+        out.append((cur, min(nxt, end)))
+        cur = nxt
+    return out
 
 
 def _mock_metrics(names: list[str], cost: float, gb: float) -> dict[str, dict[str, str]]:
@@ -401,13 +424,10 @@ class MockCostExplorerClient:
         today = date.today()
         lines = [line for line in self.lines if _mock_matches(line, Filter)]
         results = []
-        cur = start
-        while cur < end:
-            nxt = cur + timedelta(days=1) if Granularity == "DAILY" else _add_months(cur, 1)
-            b_end = min(nxt, end)
+        for b_start, b_end in _buckets(start, end, Granularity):
             groups: dict[tuple[str, ...], list[float]] = {}
             total = [0.0, 0.0]
-            d = cur
+            d = b_start
             while d < min(b_end, today + timedelta(days=1)):
                 for line in lines:
                     gb = line.gb_on(d)
@@ -423,16 +443,232 @@ class MockCostExplorerClient:
                 d += timedelta(days=1)
             results.append(
                 {
-                    "TimePeriod": {"Start": cur.isoformat(), "End": b_end.isoformat()},
+                    "TimePeriod": {"Start": b_start.isoformat(), "End": b_end.isoformat()},
                     "Total": {} if GroupBy else _mock_metrics(Metrics, *total),
                     "Groups": [{"Keys": list(k), "Metrics": _mock_metrics(Metrics, c, g)} for k, (c, g) in sorted(groups.items())],
                     "Estimated": b_end >= today,
                 }
             )
-            cur = nxt
         attrs = []
         if GroupBy and any(g["Key"] == "LINKED_ACCOUNT" for g in GroupBy):
             attrs = [{"Value": k, "Attributes": {"description": v}} for k, v in MOCK_ACCOUNTS.items()]
+        return {"ResultsByTime": results, "DimensionValueAttributes": attrs, "GroupDefinitions": GroupBy or []}
+
+
+# =====================================================================================
+# Cost Explorer stand-in that reads CSV files for --csv (dto-explorer backend/app/csv_ce.py)
+# =====================================================================================
+# The CSV format is documented in docs/csv-data.md; scripts/export-ce-csv.sh produces it
+# with the AWS CLI. Rows are aggregated in memory and get_cost_and_usage filters / groups
+# them with the same helpers as the mock client.
+
+CSV_REQUIRED = ("date", "usage_type", "usage_quantity")
+# Optional CSV column -> Cost Explorer dimension.
+CSV_OPTIONAL = {"region": "REGION", "linked_account": "LINKED_ACCOUNT", "service": "SERVICE", "record_type": "RECORD_TYPE"}
+CSV_TAG_PREFIX = "tag:"
+CSV_COST_CATEGORY_PREFIX = "cost_category:"
+
+
+class CsvDataError(ValueError):
+    """The CSV data is missing, unreadable or malformed."""
+
+
+@dataclass
+class CsvLine:
+    day: date
+    usage_type: str
+    region: str
+    account: str
+    service: str
+    record_type: str
+    gb: float
+    tags: dict[str, str] = field(default_factory=dict)
+    cost_categories: dict[str, str] = field(default_factory=dict)
+
+    def attr(self, dim: str) -> str:
+        return {
+            "USAGE_TYPE": self.usage_type,
+            "REGION": self.region,
+            "LINKED_ACCOUNT": self.account,
+            "SERVICE": self.service,
+            "RECORD_TYPE": self.record_type,
+        }.get(dim, "")
+
+
+@dataclass
+class CsvData:
+    files: list[Path]
+    rows: int
+    lines: list[CsvLine]  # aggregated, sorted by day
+    dimensions: set[str]  # REGION / LINKED_ACCOUNT / SERVICE columns present
+    tag_keys: list[str]
+    cost_categories: list[str]
+    account_names: dict[str, str]
+
+    @property
+    def date_range(self) -> tuple[date, date] | None:
+        return (self.lines[0].day, self.lines[-1].day) if self.lines else None
+
+
+def _csv_files(path: Path) -> list[Path]:
+    if path.is_dir():
+        files = sorted(p for p in path.glob("*.csv") if p.is_file())
+        if not files:
+            raise CsvDataError(f"{path}: no .csv files in directory")
+        return files
+    if path.is_file():
+        return [path]
+    raise CsvDataError(f"{path}: no such file or directory")
+
+
+def load_csv(path: Path) -> CsvData:
+    """Read one CSV file, or every *.csv file in a directory, and aggregate identical rows."""
+    files = _csv_files(path)
+    totals: dict[tuple, float] = defaultdict(float)
+    dimensions: set[str] = set()
+    tag_keys: set[str] = set()
+    categories: set[str] = set()
+    names: dict[str, str] = {}
+    rows = 0
+
+    for f in files:
+        try:
+            with f.open(newline="", encoding="utf-8-sig") as fh:
+                reader = csv.reader(fh)
+                header = next(reader, None)
+                if header is None:
+                    raise CsvDataError(f"{f}: empty file")
+                cols = [h.strip() for h in header]
+                lower = [c.lower() for c in cols]
+                missing = [c for c in CSV_REQUIRED if c not in lower]
+                if missing:
+                    raise CsvDataError(f"{f}:1: missing required column(s): {', '.join(missing)}")
+                idx = {c: i for i, c in enumerate(lower)}
+                tags = [(c[len(CSV_TAG_PREFIX):], i) for i, c in enumerate(cols) if c.lower().startswith(CSV_TAG_PREFIX)]
+                cats = [(c[len(CSV_COST_CATEGORY_PREFIX):], i) for i, c in enumerate(cols) if c.lower().startswith(CSV_COST_CATEGORY_PREFIX)]
+                dimensions |= {dim for col, dim in CSV_OPTIONAL.items() if col in idx and dim != "RECORD_TYPE"}
+                tag_keys |= {k for k, _ in tags}
+                categories |= {k for k, _ in cats}
+
+                def get(row: list[str], col: str, default: str = "") -> str:
+                    i = idx.get(col)
+                    return row[i].strip() if i is not None and i < len(row) else default
+
+                for row in reader:
+                    if not any(cell.strip() for cell in row):
+                        continue
+                    where = f"{f}:{reader.line_num}"
+                    try:
+                        day = date.fromisoformat(get(row, "date"))
+                    except ValueError:
+                        raise CsvDataError(f"{where}: date must be YYYY-MM-DD, got {get(row, 'date')!r}") from None
+                    try:
+                        gb = float(get(row, "usage_quantity"))
+                    except ValueError:
+                        raise CsvDataError(f"{where}: usage_quantity must be a number, got {get(row, 'usage_quantity')!r}") from None
+                    usage_type = get(row, "usage_type")
+                    if not usage_type:
+                        raise CsvDataError(f"{where}: usage_type is empty")
+                    account = get(row, "linked_account")
+                    if name := get(row, "linked_account_name"):
+                        names[account] = name
+                    key = (
+                        day,
+                        usage_type,
+                        get(row, "region"),
+                        account,
+                        get(row, "service"),
+                        get(row, "record_type") or "Usage",
+                        tuple((k, row[i].strip() if i < len(row) else "") for k, i in tags),
+                        tuple((k, row[i].strip() if i < len(row) else "") for k, i in cats),
+                    )
+                    totals[key] += gb
+                    rows += 1
+        except OSError as e:
+            raise CsvDataError(f"{f}: {e}") from e
+        except UnicodeDecodeError as e:
+            raise CsvDataError(f"{f}: not UTF-8 text ({e})") from e
+
+    lines = [
+        CsvLine(day, ut, region, account, service, rt, gb, dict(tags), dict(cats))
+        for (day, ut, region, account, service, rt, tags, cats), gb in totals.items()
+    ]
+    lines.sort(key=lambda line: line.day)
+    return CsvData(files, rows, lines, dimensions, sorted(tag_keys), sorted(categories), names)
+
+
+class CsvCostExplorerClient:
+    """Answers the Cost Explorer calls DtoService makes from CSV rows.
+
+    TimePeriod is ignored by the discovery calls (dimension values, tags, cost categories)
+    so that the filters list everything in the files, whatever dates they cover.
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.data = load_csv(self.path)
+
+    def reload(self) -> None:
+        """Re-read the files; on error the previously loaded data stays in place."""
+        self.data = load_csv(self.path)
+
+    @property
+    def dimensions(self) -> set[str]:
+        return self.data.dimensions
+
+    def get_dimension_values(self, TimePeriod: dict, Dimension: str, SearchString: str | None = None, **_: Any) -> dict:
+        data = self.data
+        values = sorted({line.attr(Dimension) for line in data.lines} - {""})
+        if SearchString:
+            values = [v for v in values if SearchString.lower() in v.lower()]
+        out = []
+        for v in values:
+            attrs = {"description": data.account_names[v]} if Dimension == "LINKED_ACCOUNT" and v in data.account_names else {}
+            out.append({"Value": v, "Attributes": attrs})
+        return {"DimensionValues": out, "ReturnSize": len(out), "TotalSize": len(out)}
+
+    def get_tags(self, TimePeriod: dict, **_: Any) -> dict:
+        keys = self.data.tag_keys
+        return {"Tags": keys, "ReturnSize": len(keys), "TotalSize": len(keys)}
+
+    def get_cost_categories(self, TimePeriod: dict, **_: Any) -> dict:
+        names = self.data.cost_categories
+        return {"CostCategoryNames": names, "ReturnSize": len(names), "TotalSize": len(names)}
+
+    def get_cost_and_usage(
+        self, TimePeriod: dict, Granularity: str, Metrics: list[str], Filter: dict | None = None, GroupBy: list[dict] | None = None, **_: Any
+    ) -> dict:
+        start, end = date.fromisoformat(TimePeriod["Start"]), date.fromisoformat(TimePeriod["End"])
+        if end <= start:
+            raise ValueError("Start must be before End")
+        data = self.data
+        buckets = _buckets(start, end, Granularity)
+        starts = [b for b, _ in buckets]
+        groups: list[dict[tuple[str, ...], float]] = [defaultdict(float) for _ in buckets]
+        totals = [0.0] * len(buckets)
+
+        lo = bisect.bisect_left(data.lines, start, key=lambda line: line.day)
+        hi = bisect.bisect_left(data.lines, end, key=lambda line: line.day)
+        for line in data.lines[lo:hi]:
+            if not _mock_matches(line, Filter):
+                continue
+            i = bisect.bisect_right(starts, line.day) - 1
+            totals[i] += line.gb
+            if GroupBy:
+                groups[i][tuple(_mock_group_key(line, g) for g in GroupBy)] += line.gb
+
+        results = [
+            {
+                "TimePeriod": {"Start": b_start.isoformat(), "End": b_end.isoformat()},
+                "Total": {} if GroupBy else _mock_metrics(Metrics, 0.0, totals[i]),
+                "Groups": [{"Keys": list(k), "Metrics": _mock_metrics(Metrics, 0.0, gb)} for k, gb in sorted(groups[i].items())],
+                "Estimated": False,
+            }
+            for i, (b_start, b_end) in enumerate(buckets)
+        ]
+        attrs = []
+        if GroupBy and any(g["Key"] == "LINKED_ACCOUNT" for g in GroupBy):
+            attrs = [{"Value": k, "Attributes": {"description": v}} for k, v in data.account_names.items()]
         return {"ResultsByTime": results, "DimensionValueAttributes": attrs, "GroupDefinitions": GroupBy or []}
 
 
@@ -479,6 +715,7 @@ class Summary:
     volume_series: list[SeriesPoint] = field(default_factory=list)  # transfer type -> GB
     estimated: bool = False
     mock: bool = False
+    source: str = "aws"  # aws, mock or csv
 
 
 @dataclass(frozen=True)
@@ -499,6 +736,7 @@ class Meta:
     aws_internal_types: list[str]  # hidden unless include_aws_internal
     group_by_options: list[Option]
     mock: bool
+    source: str  # aws, mock or csv
 
 
 # =====================================================================================
@@ -563,7 +801,10 @@ DIMENSIONS = {
     "DIRECTION": "Direction",
     "USAGE_TYPE": "Usage type",
 }
+# Dimensions a CSV export may leave out; the others are derived from the usage type.
+OPTIONAL_DIMENSIONS = ("REGION", "LINKED_ACCOUNT", "SERVICE")
 UNTAGGED = "(untagged)"
+NO_VALUE = "(none)"
 
 REGION_NAMES = {
     "us-east-1": "US East (N. Virginia)",
@@ -697,10 +938,13 @@ def next_dimension(group_by: str) -> str:
 
 
 class DtoService:
-    def __init__(self, ce: CostExplorer, cache: Cache, mock: bool = False):
+    def __init__(self, ce: CostExplorer, cache: Cache, source: str = "aws", dimensions: set[str] | None = None):
         self.ce = ce
         self.cache = cache
-        self.mock = mock
+        self.source = source
+        self.mock = source == "mock"
+        # OPTIONAL_DIMENSIONS the data has (None: all of them).
+        self.dimensions = dimensions
 
     def dto_usage_types(self, start: date, end: date) -> dict[str, str]:
         """All outbound-transfer usage types with data in the window, mapped to transfer type."""
@@ -753,6 +997,7 @@ class DtoService:
             include_aws_internal=include_aws_internal,
             by_type={t: 0.0 for t in TRANSFER_TYPES},
             mock=self.mock,
+            source=self.source,
         )
         if q.is_empty:
             return result
@@ -865,13 +1110,13 @@ class DtoService:
         return _and(parts)
 
     def _label(self, group_by: str, key: str, attrs: dict[str, str]) -> str:
+        if key == "":
+            return UNTAGGED if group_by.startswith(("TAG:", "COST_CATEGORY:")) else NO_VALUE
         if group_by == "REGION":
             return REGION_NAMES.get(key, key)
         if group_by == "LINKED_ACCOUNT":
             name = attrs.get(key) or self._account_names().get(key)
             return name if name and name != key else key
-        if group_by.startswith(("TAG:", "COST_CATEGORY:")) and key == "":
-            return UNTAGGED
         return key
 
     def meta(self, today: date | None = None) -> Meta:
@@ -899,7 +1144,11 @@ class DtoService:
             except Exception:
                 cost_categories = []
 
-            group_opts = [Option(value=k, label=v) for k, v in DIMENSIONS.items()]
+            group_opts = [
+                Option(value=k, label=v)
+                for k, v in DIMENSIONS.items()
+                if self.dimensions is None or k not in OPTIONAL_DIMENSIONS or k in self.dimensions
+            ]
             group_opts += [Option(value=f"TAG:{k}", label=f"Tag: {k}") for k in tag_keys]
             group_opts += [Option(value=f"COST_CATEGORY:{c}", label=f"Cost category: {c}") for c in cost_categories]
             return Meta(
@@ -913,6 +1162,7 @@ class DtoService:
                 aws_internal_types=AWS_INTERNAL_TYPES,
                 group_by_options=group_opts,
                 mock=self.mock,
+                source=self.source,
             )
 
         return self.cache.get_or_set(("meta", start, end), load)
@@ -987,6 +1237,18 @@ from textual.widgets.selection_list import Selection  # noqa: E402
 
 # Dimensions offered in the filter dialog (others are reachable through drill-down).
 FILTER_DIMS = ("LINKED_ACCOUNT", "REGION", "DIRECTION", "TRANSFER_TYPE")
+SOURCE_LABELS = {"aws": "AWS Cost Explorer", "mock": "mock data", "csv": "CSV data"}
+
+
+def available_dims(meta: Meta | None) -> set[str] | None:
+    """Breakdowns the data has (CSV files may lack region / account / service), or None for all."""
+    return None if meta is None else {o.value for o in meta.group_by_options}
+
+
+def fallback_dim(dim: str, meta: Meta | None) -> str:
+    """A breakdown on a column the CSV data lacks falls back to transfer type (as in the web UI)."""
+    available = available_dims(meta)
+    return "TRANSFER_TYPE" if available is not None and dim in OPTIONAL_DIMENSIONS and dim not in available else dim
 
 
 class FilterScreen(ModalScreen[dict[str, list[str]] | None]):
@@ -999,6 +1261,8 @@ class FilterScreen(ModalScreen[dict[str, list[str]] | None]):
         self.meta = meta
         self.filters = filters
         self.include_aws_internal = include_aws_internal
+        available = available_dims(meta) or set()
+        self.dims = [d for d in FILTER_DIMS if d not in OPTIONAL_DIMENSIONS or d in available]
 
     def compose(self) -> ComposeResult:
         types = [t for t in self.meta.transfer_types if self.include_aws_internal or t not in self.meta.aws_internal_types]
@@ -1011,7 +1275,7 @@ class FilterScreen(ModalScreen[dict[str, list[str]] | None]):
         with Vertical(id="filter-dialog"):
             yield Label("[b]Filters[/]  [dim]space toggles · values are OR'd, dimensions AND'd[/]")
             with Horizontal(id="filter-lists"):
-                for dim in FILTER_DIMS:
+                for dim in self.dims:
                     current = set(self.filters.get(dim, []))
                     with Vertical(classes="filter-col"):
                         yield Label(DIMENSIONS[dim])
@@ -1023,15 +1287,15 @@ class FilterScreen(ModalScreen[dict[str, list[str]] | None]):
 
     @on(Button.Pressed, "#apply")
     def _apply(self) -> None:
-        out = {k: v for k, v in self.filters.items() if k not in FILTER_DIMS}
-        for dim in FILTER_DIMS:
+        out = {k: v for k, v in self.filters.items() if k not in self.dims}
+        for dim in self.dims:
             if selected := self.query_one(f"#f-{dim}", SelectionList).selected:
                 out[dim] = list(selected)
         self.dismiss(out)
 
     @on(Button.Pressed, "#clear")
     def _clear(self) -> None:
-        for dim in FILTER_DIMS:
+        for dim in self.dims:
             self.query_one(f"#f-{dim}", SelectionList).deselect_all()
 
     @on(Button.Pressed, "#cancel")
@@ -1139,10 +1403,22 @@ class DtoApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.sub_title = "mock data" if self.service.mock else "AWS Cost Explorer"
+        self.sub_title = SOURCE_LABELS[self.service.source]
         self._sync_period_widgets()
         self.query_one("#table", DataTable).focus()
+        if info := self._csv_info():
+            self.notify(info, title="CSV data", timeout=8)
         self.load_meta()
+
+    def _csv_info(self) -> str:
+        """Files, rows and dates read with --csv (what DTO Explorer reports in /api/health)."""
+        client = self.service.ce.client
+        if not isinstance(client, CsvCostExplorerClient):
+            return ""
+        data = client.data
+        dates = f"{data.date_range[0]} → {data.date_range[1]}" if data.date_range else "no rows"
+        files = str(data.files[0]) if len(data.files) == 1 else f"{len(data.files)} files in {client.path}"
+        return f"{data.rows:,} rows from {files}, {dates}"
 
     # ---- data loading ----------------------------------------------------
 
@@ -1160,6 +1436,7 @@ class DtoApp(App):
         if meta:
             if self.state.group_by == "REGION" and self.tag_key and self.tag_key in meta.tag_keys:
                 self.state.group_by = f"TAG:{self.tag_key}"
+            self.state.group_by = fallback_dim(self.state.group_by, meta)
             opts = [(o.label, o.value) for o in meta.group_by_options]
             if self.state.group_by not in {o.value for o in meta.group_by_options}:
                 opts.append((dim_label(self.state.group_by), self.state.group_by))
@@ -1167,7 +1444,9 @@ class DtoApp(App):
                 sel = self.query_one("#group_by", Select)
                 sel.set_options(opts)
                 sel.value = self.state.group_by
-            if not meta.tag_keys:
+            if not meta.tag_keys and meta.source == "csv":
+                self.notify("No tag:<key> columns in the CSV files. Export with a tag (e.g. TAG:vpc) to break data volume down by VPC or team.", timeout=8)
+            elif not meta.tag_keys:
                 self.notify("No cost allocation tags found. Activate tags (e.g. vpc) in Billing to break data volume down by VPC or team.", timeout=8)
         self.reload()
 
@@ -1254,7 +1533,7 @@ class DtoApp(App):
     def _render_summary(self) -> None:
         s = self.summary
         assert s is not None
-        badges = " · ".join(b for b in ("mock data" if s.mock else "AWS Cost Explorer", "estimated" if s.estimated else "") if b)
+        badges = " · ".join(b for b in (SOURCE_LABELS[s.source], "estimated" if s.estimated else "") if b)
         self.sub_title = badges
         dw = s.data_window
         prev = s.previous_window
@@ -1442,7 +1721,7 @@ class DtoApp(App):
         current = self.state.filters.get(gb, [])
         if row.key not in current:
             self.state.filters[gb] = [*current, row.key]
-        self.state.group_by = next_dimension(gb)
+        self.state.group_by = fallback_dim(next_dimension(gb), self.meta)
         self._set_group_select()
         self.search = ""
         self.query_one("#search", Input).value = ""
@@ -1525,9 +1804,24 @@ class DtoApp(App):
         self.notify(f"Exported {len(self.summary.rows)} rows to {path}")
 
     def action_refresh(self) -> None:
+        if isinstance(self.service.ce.client, CsvCostExplorerClient):
+            self.reload_csv()
+            return
         self.service.cache.clear()
         self.notify("Cache cleared, fetching fresh data (each Cost Explorer request costs $0.01)")
         self.load_meta()
+
+    @work(thread=True, exclusive=True, group="csv")
+    def reload_csv(self) -> None:
+        """Re-read the CSV files; if they are invalid, keep the data already loaded."""
+        try:
+            self.service.ce.client.reload()
+        except CsvDataError as e:
+            self.call_from_thread(self.notify, f"{e}\nKeeping the data already loaded.", title="CSV data", severity="error", timeout=15)
+            return
+        self.service.cache.clear()
+        self.call_from_thread(self.notify, f"Re-read the CSV files: {self._csv_info()}", title="CSV data")
+        self.call_from_thread(self.load_meta)
 
     def action_toggle_theme(self) -> None:
         self.theme = "textual-light" if self.current_theme.dark else "textual-dark"
@@ -1535,7 +1829,7 @@ class DtoApp(App):
     def action_help(self) -> None:
         self.notify(
             "[ / ] previous/next period · f filters · Enter drill down · Backspace back · x clear filters\n"
-            "/ search · s or click header to sort · e export CSV · r refresh · d theme · q quit\n"
+            "/ search · s or click header to sort · e export CSV · r refresh (re-reads --csv files) · d theme · q quit\n"
             "Tab moves between the period, group-by, traffic within AWS and NAT volume controls.",
             title="Keys",
             timeout=12,
@@ -1555,6 +1849,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Explore AWS data transfer volume in the terminal.")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("--mock", action="store_true", default=_env_bool("DTO_MOCK"), help="use synthetic data instead of AWS (DTO_MOCK)")
+    p.add_argument(
+        "--csv",
+        type=Path,
+        default=os.environ.get("DTO_CSV_PATH") or None,
+        metavar="PATH",
+        help="read usage from a CSV file, or every *.csv file in a folder, instead of AWS; see docs/csv-data.md (DTO_CSV_PATH)",
+    )
     p.add_argument("--profile", default=os.environ.get("DTO_AWS_PROFILE"), help="AWS profile (DTO_AWS_PROFILE, else the standard boto3 chain incl. AWS_PROFILE)")
     p.add_argument("--ce-region", default=os.environ.get("DTO_CE_REGION", "us-east-1"), help="Cost Explorer endpoint region (DTO_CE_REGION)")
     p.add_argument("--cache-ttl", type=int, default=int(os.environ.get("DTO_CACHE_TTL_SECONDS", "3600")), help="cache lifetime in seconds, 0 disables (DTO_CACHE_TTL_SECONDS)")
@@ -1567,6 +1868,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--include-nat-volume", action="store_true", help="add NAT Gateway data processed to transit (it duplicates the traffic it carries)")
     p.add_argument("--filter", action="append", default=[], metavar="DIM=VALUE", help="repeatable, e.g. REGION=us-east-1 or TAG:vpc=prod")
     args = p.parse_args(argv)
+    if args.mock and args.csv:
+        p.error("--csv can't be combined with --mock (or DTO_MOCK)")
     if args.period == "custom" and not (args.start and args.end):
         p.error("--period custom needs --start and --end")
     try:
@@ -1580,7 +1883,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    service = DtoService(make_cost_explorer(args.mock, args.profile, args.ce_region), Cache(args.cache_ttl), mock=args.mock)
+    try:
+        ce = make_cost_explorer(args.mock, args.profile, args.ce_region, args.csv)
+    except CsvDataError as e:
+        print(f"dto_tui.py: CSV data: {e}", file=sys.stderr)
+        sys.exit(2)
+    source = "mock" if args.mock else "csv" if args.csv else "aws"
+    service = DtoService(ce, Cache(args.cache_ttl), source=source, dimensions=getattr(ce.client, "dimensions", None))
     state = ViewState(
         period=args.period,
         anchor=args.start or date.today(),
